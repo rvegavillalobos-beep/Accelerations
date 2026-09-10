@@ -87,12 +87,12 @@ with tab1:
 
         st.markdown("**Instrucciones:** Haz clic sobre una fila de la tabla para resaltar el instante y eje exacto en la gráfica inferior.")
 
-        # TABLA INTERACTIVA (Streamlit >= 1.35.0)
+        # TABLA INTERACTIVA
         event_selection = st.dataframe(
             events_df[['Índice/Tiempo (s)', 'Eje Afectado', 'Valor Medido', 'Umbral Configurado']],
             use_container_width=True,
             on_select="rerun",
-            selection_mode="single_row",
+            selection_mode="single-row",
             key="threshold_table"
         )
 
