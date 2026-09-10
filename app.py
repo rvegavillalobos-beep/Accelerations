@@ -243,11 +243,8 @@ events_df = detect_all_events(
 )
 
 # ---------------------------------------------------------
-# PANELES DE MÉTRICAS / KPIS
+# PANELES DE MÉTRICAS CON RANGO Y ZONAS DE RIESGO
 # ---------------------------------------------------------
-dt_sample = df['elapsed_sec'].diff().median()
-fs = 1.0 / dt_sample if dt_sample > 0 else 0
-
 st.markdown("### 📊 Estado General de Traza y Fricción")
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -255,19 +252,27 @@ c1.metric("⏱️ Muestras / Frecuencia", f"{len(df):,} pts", f"{fs:.1f} Hz")
 c2.metric("⌛ Duración Total", f"{df['elapsed_sec'].iloc[-1]/60:.1f} min")
 
 if enable_physics_model and has_3d_acc:
-    peak_risk = plot_df['Slip_Risk_Ratio'].max()
+    r_min = plot_df['Slip_Risk_Ratio'].min()
+    r_max = plot_df['Slip_Risk_Ratio'].max()
     slips_count = (plot_df['Slip_Risk_Ratio'] >= mu_s).sum()
-    c3.metric("🧲 Coeficiente µs", f"{mu_s:.2f}")
-    c4.metric("💥 Riesgo Pico (R)", f"{peak_risk:.3f}", f"{'DESLIZAMIENTO' if peak_risk >= mu_s else 'OK'}")
-    c5.metric("🚨 Eventos Totales", f"{len(events_df)}", f"{slips_count} por Fricción", delta_color="inverse")
-else:
-    c3.metric("🎯 Thresholds Superados", f"{len(events_df)} eventos")
-    max_v = plot_df[visible_axes].max().max() if visible_axes else 0.0
-    min_v = plot_df[visible_axes].min().min() if visible_axes else 0.0
-    c4.metric("🚀 Pico Máximo", f"{max_v:.3f}")
-    c5.metric("📉 Mínimo", f"{min_v:.3f}")
+    
+    # 1. Métrica con el Rango Dinámico Completo [R_min - R_max]
+    c3.metric("📐 Rango de Riesgo (R)", f"{r_min:.2f} a {r_max:.2f}")
+    
+    # 2. Estado de Riesgo Pico
+    c4.metric("💥 Riesgo Pico (R_max)", f"{r_max:.3f}", f"{'DESLIZAMIENTO' if r_max >= mu_s else 'OK'}")
+    c5.metric("🚨 Eventos Registrados", f"{len(events_df)}", f"{slips_count} por Fricción", delta_color="inverse")
 
-st.markdown("---")
+    # BARRA DE DISTRIBUCIÓN POR RANGOS DE PELIGRO
+    safe_pct = (plot_df['Slip_Risk_Ratio'] < (mu_s * safety_factor)).mean() * 100
+    warn_pct = ((plot_df['Slip_Risk_Ratio'] >= (mu_s * safety_factor)) & (plot_df['Slip_Risk_Ratio'] < mu_s)).mean() * 100
+    crit_pct = (plot_df['Slip_Risk_Ratio'] >= mu_s).mean() * 100
+
+    st.markdown("**Distribución del Tiempo de Traza por Rangos de Riesgo:**")
+    col_s, col_w, col_c = st.columns(3)
+    col_s.caption(f"🟢 **Seguro (R < {mu_s * safety_factor:.2f}):** {safe_pct:.1f}% del tiempo")
+    col_w.caption(f"🟡 **Advertencia ({mu_s * safety_factor:.2f} ≤ R < {mu_s:.2f}):** {warn_pct:.1f}% del tiempo")
+    col_c.caption(f"🔴 **Deslizamiento (R ≥ {mu_s:.2f}):** {crit_pct:.1f}% del tiempo")
 
 # ---------------------------------------------------------
 # PESTAÑAS DE VISUALIZACIÓN Y ANÁLISIS
