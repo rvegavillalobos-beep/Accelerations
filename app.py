@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from scipy.signal import find_peaks
 import io
 
@@ -111,7 +110,7 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.subheader("👁️ Ocultar / Mostrar Ejes")
 visible_axes = st.sidebar.multiselect(
-    "Ejes visibles en la gráfica:",
+    "Ejes visibles y evaluados:",
     options=selected_axes,
     default=selected_axes
 )
@@ -128,22 +127,17 @@ remove_gravity = st.sidebar.checkbox("Remover Gravedad (Aceleración Dinámica)"
 st.sidebar.markdown("---")
 st.sidebar.subheader("⚠️ Configuración de Umbrales (Thresholds)")
 
-primary_channel = st.sidebar.selectbox("Canal para Detección de Umbral:", options=selected_axes)
-
-signal_min = float(df[primary_channel].min())
-signal_max = float(df[primary_channel].max())
-
 enable_upper = st.sidebar.checkbox("Activar Umbral Superior", value=True)
 upper_thresh = st.sidebar.number_input(
-    "Umbral Superior:", 
-    value=round(signal_max * 0.85, 3), 
+    "Umbral Superior (|g|):", 
+    value=0.16, 
     step=0.01
 ) if enable_upper else None
 
 enable_lower = st.sidebar.checkbox("Activar Umbral Inferior", value=False)
 lower_thresh = st.sidebar.number_input(
-    "Umbral Inferior:", 
-    value=round(signal_min * 1.15, 3), 
+    "Umbral Inferior (|g|):", 
+    value=-0.16, 
     step=0.01
 ) if enable_lower else None
 
@@ -168,9 +162,12 @@ if remove_gravity and 'AccZ(g)' in plot_df.columns:
         plot_df['Acc_Mag'] = np.sqrt(plot_df['AccX(g)']**2 + plot_df['AccY(g)']**2 + plot_df['AccZ(g)']**2)
 
 # ---------------------------------------------------------
-# ALGORITMO DE DETECCIÓN DE THRESHOLDS
+# ALGORITMO DE DETECCIÓN DE THRESHOLDS (MULTIEJE)
 # ---------------------------------------------------------
-def detect_threshold_events(data_df, signal_col, upper=None, lower=None, min_dist_s=1.0):
+def detect_threshold_events_multi(data_df, channels, upper=None, lower=None, min_dist_s=1.0):
+    """
+    Evalúa dinámicamente múltiples ejes simultáneamente e identifica sobrepasos de umbral.
+    """
     dt = data_df['elapsed_sec'].diff().median()
     if pd.isna(dt) or dt <= 0:
         dt = 0.05
@@ -178,38 +175,45 @@ def detect_threshold_events(data_df, signal_col, upper=None, lower=None, min_dis
     
     events = []
     
-    if upper is not None:
-        peaks, _ = find_peaks(data_df[signal_col].values, height=upper, distance=dist_samples)
-        for p in peaks:
-            events.append({
-                'Índice': p,
-                'Timestamp (ISO)': data_df['time'].iloc[p],
-                'Tiempo Transcurrido (s)': round(data_df['elapsed_sec'].iloc[p], 3),
-                'Tipo de Evento': 'Exceso Superior ↑',
-                'Valor Medido': round(data_df[signal_col].iloc[p], 4),
-                'Umbral Establ.': upper
-            })
+    for col in channels:
+        if col not in data_df.columns:
+            continue
             
-    if lower is not None:
-        peaks_low, _ = find_peaks(-data_df[signal_col].values, height=-lower, distance=dist_samples)
-        for p in peaks_low:
-            events.append({
-                'Índice': p,
-                'Timestamp (ISO)': data_df['time'].iloc[p],
-                'Tiempo Transcurrido (s)': round(data_df['elapsed_sec'].iloc[p], 3),
-                'Tipo de Evento': 'Exceso Inferior ↓',
-                'Valor Medido': round(data_df[signal_col].iloc[p], 4),
-                'Umbral Establ.': lower
-            })
+        if upper is not None:
+            peaks, _ = find_peaks(data_df[col].values, height=upper, distance=dist_samples)
+            for p in peaks:
+                events.append({
+                    'Índice': p,
+                    'Timestamp (ISO)': data_df['time'].iloc[p],
+                    'Tiempo Transcurrido (s)': round(data_df['elapsed_sec'].iloc[p], 3),
+                    'Eje / Canal': col,
+                    'Tipo de Evento': 'Exceso Superior ↑',
+                    'Valor Medido': round(data_df[col].iloc[p], 4),
+                    'Umbral Establ.': upper
+                })
+                
+        if lower is not None:
+            peaks_low, _ = find_peaks(-data_df[col].values, height=-lower, distance=dist_samples)
+            for p in peaks_low:
+                events.append({
+                    'Índice': p,
+                    'Timestamp (ISO)': data_df['time'].iloc[p],
+                    'Tiempo Transcurrido (s)': round(data_df['elapsed_sec'].iloc[p], 3),
+                    'Eje / Canal': col,
+                    'Tipo de Evento': 'Exceso Inferior ↓',
+                    'Valor Medido': round(data_df[col].iloc[p], 4),
+                    'Umbral Establ.': lower
+                })
             
     res_df = pd.DataFrame(events)
     if not res_df.empty:
-        res_df = res_df.sort_values(by='Tiempo Transcurrido (s)').reset_index(drop=True)
+        res_df = res_df.sort_values(by=['Tiempo Transcurrido (s)', 'Eje / Canal']).reset_index(drop=True)
     return res_df
 
-events_df = detect_threshold_events(
+# Detección multieje considerando únicamente los ejes VISIBLES
+events_df = detect_threshold_events_multi(
     plot_df, 
-    primary_channel, 
+    channels=visible_axes, 
     upper=upper_thresh, 
     lower=lower_thresh, 
     min_dist_s=min_distance_sec
@@ -225,8 +229,12 @@ col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("⏱️ Muestras / Frecuencia", f"{len(df):,} pts", f"{fs:.1f} Hz")
 col2.metric("⌛ Duración Total", f"{df['elapsed_sec'].iloc[-1]/60:.1f} min")
 col3.metric("🎯 Thresholds Superados", f"{len(events_df)} eventos")
-col4.metric(f"🚀 Pico Máx ({primary_channel})", f"{plot_df[primary_channel].max():.3f}")
-col5.metric(f"📉 Mínimo ({primary_channel})", f"{plot_df[primary_channel].min():.3f}")
+
+max_val = plot_df[visible_axes].max().max() if visible_axes else 0.0
+min_val = plot_df[visible_axes].min().min() if visible_axes else 0.0
+
+col4.metric("🚀 Pico Máximo (Ejes)", f"{max_val:.3f}")
+col5.metric("📉 Mínimo (Ejes)", f"{min_val:.3f}")
 
 st.markdown("---")
 
@@ -240,23 +248,47 @@ tab_plot, tab_events, tab_fft, tab_stats = st.tabs([
     "📋 Estadísticas Descriptivas"
 ])
 
+# EVENTO SELECCIONADO DESDE LA TABLA (Mantenido en session_state)
+selected_event = None
+if 'selected_event_idx' in st.session_state and not events_df.empty:
+    idx = st.session_state['selected_event_idx']
+    if idx < len(events_df):
+        selected_event = events_df.iloc[idx]
+
 # 1. PESTAÑA DE PLOTEO INTERACTIVO
 with tab_plot:
     st.subheader(f"Visualización de Señales: {target_group}")
+    
+    if selected_event is not None:
+        st.info(
+            f"📍 **Evento Seleccionado:** Eje **{selected_event['Eje / Canal']}** en t = **{selected_event['Tiempo Transcurrido (s)']} s** "
+            f"(Valor: **{selected_event['Valor Medido']}** | Tipo: **{selected_event['Tipo de Evento']}**)"
+        )
     
     fig = go.Figure()
     
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
     
     for idx, axis_col in enumerate(visible_axes):
+        opacity = 1.0
+        line_width = 1.5
+        
+        # Resaltar el eje seleccionado en la tabla si corresponde
+        if selected_event is not None:
+            if axis_col == selected_event['Eje / Canal']:
+                line_width = 2.8
+            else:
+                opacity = 0.35
+
         fig.add_trace(go.Scatter(
             x=plot_df['elapsed_sec'],
             y=plot_df[axis_col],
             mode='lines',
             name=axis_col,
-            line=dict(width=1.5, color=colors[idx % len(colors)]),
+            line=dict(width=line_width, color=colors[idx % len(colors)]),
+            opacity=opacity,
             hovertext=plot_df['time'],
-            hovertemplate='<b>Tiempo:</b> %{x:.2f} s<br><b>Fecha:</b> %{hovertext}<br><b>Valor:</b> %{y:.4f}<extra></extra>'
+            hovertemplate='<b>Eje:</b> ' + axis_col + '<br><b>Tiempo:</b> %{x:.2f} s<br><b>Fecha:</b> %{hovertext}<br><b>Valor:</b> %{y:.4f}<extra></extra>'
         ))
 
     # Líneas y zonas de Umbral
@@ -265,7 +297,7 @@ with tab_plot:
             y=upper_thresh, 
             line_dash="dash", 
             line_color="crimson", 
-            annotation_text=f"Umbral Sup: {upper_thresh}", 
+            annotation_text=f"+Umbral ({upper_thresh})", 
             annotation_position="top right"
         )
     if lower_thresh is not None:
@@ -273,7 +305,7 @@ with tab_plot:
             y=lower_thresh, 
             line_dash="dash", 
             line_color="royalblue", 
-            annotation_text=f"Umbral Inf: {lower_thresh}", 
+            annotation_text=f"-Umbral ({lower_thresh})", 
             annotation_position="bottom right"
         )
 
@@ -284,9 +316,35 @@ with tab_plot:
             y=events_df['Valor Medido'],
             mode='markers',
             name='Picos / Threshold Breached',
-            marker=dict(symbol='x', size=10, color='red', line=dict(width=2)),
-            hovertext=events_df['Timestamp (ISO)'],
-            hovertemplate='<b>EVENTO DETECTADO</b><br><b>Tiempo:</b> %{x:.2f} s<br><b>Fecha:</b> %{hovertext}<br><b>Pico:</b> %{y:.4f}<extra></extra>'
+            marker=dict(symbol='x', size=8, color='red', line=dict(width=1.5)),
+            hovertext=events_df['Eje / Canal'],
+            hovertemplate='<b>EVENTO DETECTADO</b><br><b>Eje:</b> %{hovertext}<br><b>Tiempo:</b> %{x:.2f} s<br><b>Pico:</b> %{y:.4f}<extra></extra>'
+        ))
+
+    # MARCADOR ESPECÍFICO DEL EVENTO SELECCIONADO EN LA TABLA
+    if selected_event is not None:
+        selected_time = selected_event['Tiempo Transcurrido (s)']
+        selected_axis = selected_event['Eje / Canal']
+        selected_val = selected_event['Valor Medido']
+
+        # Línea vertical indicando el momento exacto
+        fig.add_vline(
+            x=selected_time,
+            line_width=2,
+            line_dash="dot",
+            line_color="gold",
+            annotation_text=f" Evento {selected_axis}",
+            annotation_position="top left"
+        )
+
+        # Marcador con símbolo destacado
+        fig.add_trace(go.Scatter(
+            x=[selected_time],
+            y=[selected_val],
+            mode='markers',
+            name='Seleccionado',
+            marker=dict(symbol='cross', size=15, color='yellow', line=dict(width=2, color='black')),
+            hoverinfo='skip'
         ))
 
     fig.update_layout(
@@ -305,12 +363,25 @@ with tab_events:
     st.subheader("🚨 Marcas de Tiempo de Umbrales Excedidos")
     
     if events_df.empty:
-        st.info("No se registraron eventos que superen los umbrales configurados.")
+        st.info("No se registraron eventos que superen los umbrales configurados en los ejes visibles.")
     else:
         st.write(f"Se han contabilizado **{len(events_df)}** eventos que violan los umbrales estipulados:")
+        st.caption("👈 **Haz clic sobre cualquier fila de la tabla** para ubicar y resaltar el evento exacto en la gráfica interactiva.")
         
-        st.dataframe(events_df, use_container_width=True)
-        
+        # TABLA INTERACTIVA CON SELECCIÓN DE FILA
+        event_selection = st.dataframe(
+            events_df[['Índice', 'Timestamp (ISO)', 'Tiempo Transcurrido (s)', 'Eje / Canal', 'Tipo de Evento', 'Valor Medido', 'Umbral Establ.']],
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="threshold_table"
+        )
+
+        # Actualizar índice seleccionado
+        selected_rows = event_selection.get("selection", {}).get("rows", [])
+        if selected_rows:
+            st.session_state['selected_event_idx'] = selected_rows[0]
+
         # Botón para descargar reporte de eventos
         csv_events = events_df.to_csv(index=False).encode('utf-8')
         st.download_button(
@@ -324,7 +395,7 @@ with tab_events:
 with tab_fft:
     st.subheader("⚡ Espectro de Frecuencia (Transformada Rápida de Fourier)")
     
-    fft_channel = st.selectbox("Seleccionar canal para FFT:", options=selected_axes)
+    fft_channel = st.selectbox("Seleccionar canal para FFT:", options=visible_axes if visible_axes else selected_axes)
     
     signal_data = plot_df[fft_channel].values - np.mean(plot_df[fft_channel].values)
     n = len(signal_data)
@@ -361,7 +432,7 @@ with tab_fft:
 # 4. PESTAÑA DE ESTADÍSTICAS
 with tab_stats:
     st.subheader("📋 Resumen Estadístico Completo")
-    st.dataframe(df[selected_axes].describe().T, use_container_width=True)
+    st.dataframe(df[visible_axes].describe().T if visible_axes else df[selected_axes].describe().T, use_container_width=True)
     
     # Descarga de datos limpios
     csv_clean = plot_df.to_csv(index=False).encode('utf-8')
