@@ -9,7 +9,7 @@ import io
 # CONFIGURACIÓN DE PÁGINA Y ESTILOS
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Procesador de Acelerómetro & Análisis de Deslizamiento",
+    page_title="Procesador de Acelerómetro & Modelo de Deslizamiento",
     page_icon="📈",
     layout="wide"
 )
@@ -116,7 +116,7 @@ st.sidebar.subheader("🎛️ Filtrado de Señal")
 apply_smoothing = st.sidebar.checkbox("Aplicar Media Móvil (Suavizado)", value=False)
 window_size = st.sidebar.slider("Ventana de suavizado (muestras):", 3, 51, 9, step=2) if apply_smoothing else 1
 
-remove_gravity = st.sidebar.checkbox("Remover Gravedad (Aceleración Dinámica)", value=False)
+remove_gravity = st.sidebar.checkbox("Remover Gravedad en Z (Aceleración Dinámica)", value=False)
 
 # Configuración de Física y Fricción
 st.sidebar.markdown("---")
@@ -145,27 +145,29 @@ if apply_smoothing:
     for col in selected_axes:
         plot_df[col] = plot_df[col].rolling(window=window_size, center=True).mean().bfill().ffill()
 
-if remove_gravity and 'AccZ(g)' in plot_df.columns:
-    plot_df['AccZ(g)'] = plot_df['AccZ(g)'] - plot_df['AccZ(g)'].mean()
-    if 'Acc_Mag' in plot_df.columns:
-        plot_df['Acc_Mag'] = np.sqrt(plot_df['AccX(g)']**2 + plot_df['AccY(g)']**2 + plot_df['AccZ(g)']**2)
+# Detección inteligente de columnas triaxiales X, Y, Z
+acc_x_col = next((c for c in plot_df.columns if 'acc' in c.lower() and 'x' in c.lower()), None)
+acc_y_col = next((c for c in plot_df.columns if 'acc' in c.lower() and 'y' in c.lower()), None)
+acc_z_col = next((c for c in plot_df.columns if 'acc' in c.lower() and 'z' in c.lower()), None)
+has_3d_acc = all([acc_x_col, acc_y_col, acc_z_col])
 
-# CÁLCULO DEL MODELO DE FÍSICA DE DESLIZAMIENTO
-has_3d_acc = all(col in plot_df.columns for col in ['AccX(g)', 'AccY(g)', 'AccZ(g)'])
+if remove_gravity and acc_z_col:
+    plot_df[acc_z_col] = plot_df[acc_z_col] - plot_df[acc_z_col].mean()
 
+# MODELO DE FÍSICA DE DESLIZAMIENTO
 if enable_physics_model and has_3d_acc:
     # 1. Aceleración Horizontal Resultante en el Plano XY
-    plot_df['Acc_Horiz_XY'] = np.sqrt(plot_df['AccX(g)']**2 + plot_df['AccY(g)']**2)
+    plot_df['Acc_Horiz_XY'] = np.sqrt(plot_df[acc_x_col]**2 + plot_df[acc_y_col]**2)
     
     # 2. Fuerza Normal Dinámica considerando el Eje Z
-    acc_z_vals = plot_df['AccZ(g)'].values
+    acc_z_vals = plot_df[acc_z_col].values
     mean_z = np.mean(acc_z_vals)
     normal_g = acc_z_vals if mean_z > 0.5 else (1.0 + acc_z_vals)
-    normal_g = np.maximum(0.01, normal_g) # Prevenir división por cero si despega
+    normal_g = np.maximum(0.01, normal_g) # Prevenir división por cero
     
     plot_df['Normal_Force_g'] = normal_g
     
-    # 3. Ratio de Riesgo de Deslizamiento (R)
+    # 3. Ratio de Riesgo de Deslizamiento R(t)
     plot_df['Slip_Risk_Ratio'] = plot_df['Acc_Horiz_XY'] / plot_df['Normal_Force_g']
     
     # 4. Aceleración Horizontal Máxima Permitida instante a instante
@@ -182,7 +184,7 @@ def detect_all_events(data_df, channels, upper=None, lower=None, min_dist_s=1.0,
     
     events = []
     
-    # A) Detección de sobrepaso directo en canales seleccionados
+    # A) Detección de sobrepaso directo por eje
     for col in channels:
         if col not in data_df.columns:
             continue
@@ -221,7 +223,7 @@ def detect_all_events(data_df, channels, upper=None, lower=None, min_dist_s=1.0,
                 'Índice': p,
                 'Timestamp (ISO)': data_df['time'].iloc[p],
                 'Tiempo Transcurrido (s)': round(data_df['elapsed_sec'].iloc[p], 3),
-                'Eje / Criterio': '🚨 Deslizamiento Físico (Vector XY / Normal Z)',
+                'Eje / Criterio': '🚨 Deslizamiento Físico (XY / Normal Z)',
                 'Tipo de Evento': 'Riesgo R >= µs',
                 'Valor Medido': round(data_df['Slip_Risk_Ratio'].iloc[p], 4),
                 'Límite Establ.': mu_stat
@@ -243,8 +245,12 @@ events_df = detect_all_events(
 )
 
 # ---------------------------------------------------------
-# PANELES DE MÉTRICAS CON RANGO Y ZONAS DE RIESGO
+# PANELES DE MÉTRICAS Y KPIS CON RANGOS
 # ---------------------------------------------------------
+# Cálculo preventivo de frecuencia de muestreo (fs) para evitar NameError
+dt_sample = df['elapsed_sec'].diff().median()
+fs = 1.0 / dt_sample if (pd.notna(dt_sample) and dt_sample > 0) else 0.0
+
 st.markdown("### 📊 Estado General de Traza y Fricción")
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -256,14 +262,11 @@ if enable_physics_model and has_3d_acc:
     r_max = plot_df['Slip_Risk_Ratio'].max()
     slips_count = (plot_df['Slip_Risk_Ratio'] >= mu_s).sum()
     
-    # 1. Métrica con el Rango Dinámico Completo [R_min - R_max]
     c3.metric("📐 Rango de Riesgo (R)", f"{r_min:.2f} a {r_max:.2f}")
-    
-    # 2. Estado de Riesgo Pico
     c4.metric("💥 Riesgo Pico (R_max)", f"{r_max:.3f}", f"{'DESLIZAMIENTO' if r_max >= mu_s else 'OK'}")
     c5.metric("🚨 Eventos Registrados", f"{len(events_df)}", f"{slips_count} por Fricción", delta_color="inverse")
 
-    # BARRA DE DISTRIBUCIÓN POR RANGOS DE PELIGRO
+    # Distribución porcentual por zonas
     safe_pct = (plot_df['Slip_Risk_Ratio'] < (mu_s * safety_factor)).mean() * 100
     warn_pct = ((plot_df['Slip_Risk_Ratio'] >= (mu_s * safety_factor)) & (plot_df['Slip_Risk_Ratio'] < mu_s)).mean() * 100
     crit_pct = (plot_df['Slip_Risk_Ratio'] >= mu_s).mean() * 100
@@ -273,6 +276,14 @@ if enable_physics_model and has_3d_acc:
     col_s.caption(f"🟢 **Seguro (R < {mu_s * safety_factor:.2f}):** {safe_pct:.1f}% del tiempo")
     col_w.caption(f"🟡 **Advertencia ({mu_s * safety_factor:.2f} ≤ R < {mu_s:.2f}):** {warn_pct:.1f}% del tiempo")
     col_c.caption(f"🔴 **Deslizamiento (R ≥ {mu_s:.2f}):** {crit_pct:.1f}% del tiempo")
+else:
+    c3.metric("🎯 Thresholds Superados", f"{len(events_df)} eventos")
+    max_v = plot_df[visible_axes].max().max() if visible_axes else 0.0
+    min_v = plot_df[visible_axes].min().min() if visible_axes else 0.0
+    c4.metric("🚀 Pico Máximo", f"{max_v:.3f}")
+    c5.metric("📉 Mínimo", f"{min_v:.3f}")
+
+st.markdown("---")
 
 # ---------------------------------------------------------
 # PESTAÑAS DE VISUALIZACIÓN Y ANÁLISIS
@@ -303,7 +314,6 @@ with tab_plot:
     fig = go.Figure()
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
     
-    # Dibujar Ejes Seleccionados
     for idx, axis_col in enumerate(visible_axes):
         opacity = 1.0
         line_width = 1.5
@@ -325,7 +335,7 @@ with tab_plot:
             hovertemplate='<b>Eje:</b> ' + axis_col + '<br><b>Tiempo:</b> %{x:.2f} s<br><b>Valor:</b> %{y:.4f}<extra></extra>'
         ))
 
-    # Curvas Adicionales de Fricción Dinámica (Si aplican)
+    # Curvas Adicionales de Fricción Dinámica
     if enable_physics_model and has_3d_acc and target_group == "Aceleración (g)":
         show_vector_xy = st.checkbox("Mostrar Aceleración Horizontal Resultante (Acc_Horiz_XY)", value=True)
         show_allowed_limit = st.checkbox("Mostrar Límite Dinámico Permitido por Z (Acc_Max_Allowed)", value=True)
@@ -356,7 +366,7 @@ with tab_plot:
     if lower_thresh is not None:
         fig.add_hline(y=lower_thresh, line_dash="dash", line_color="royalblue", annotation_text=f"-Umbral ({lower_thresh})")
 
-    # Resaltar Eventos
+    # Marcar Eventos
     if not events_df.empty:
         fig.add_trace(go.Scatter(
             x=events_df['Tiempo Transcurrido (s)'],
@@ -368,7 +378,7 @@ with tab_plot:
             hovertemplate='<b>EVENTO DETECTADO</b><br><b>Criterio:</b> %{hovertext}<br><b>Tiempo:</b> %{x:.2f} s<br><b>Valor:</b> %{y:.4f}<extra></extra>'
         ))
 
-    # Marcador de Evento Seleccionado en Tabla
+    # Marcador del Evento Seleccionado en la Tabla
     if selected_event is not None:
         selected_time = selected_event['Tiempo Transcurrido (s)']
         selected_val = selected_event['Valor Medido']
