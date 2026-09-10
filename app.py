@@ -29,8 +29,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📈 Procesador Analítico & Modelo de Deslizamiento en Conveyor")
-st.caption("Análisis dinámico de vibración, acoplamiento vectorial 3D y evaluación de fricción en tiempo real.")
+st.title("📈 Procesador Analítico & Modelo Dinámico de Deslizamiento en Conveyor")
+st.caption("Evaluación de fricción, Jerk (impacto seco), estimación de desplazamiento real y diagnóstico de causa raíz.")
 
 # ---------------------------------------------------------
 # CARGA Y PROCESAMIENTO DE DATOS
@@ -54,7 +54,7 @@ def load_and_preprocess_data(file_bytes_or_path):
         df['elapsed_sec'] = np.arange(len(df)) * 0.05
         df['time'] = df['elapsed_sec'].astype(str) + " s"
 
-    # Mapeo de columnas de aceleración
+    # Mapeo de columnas de aceleración y magnitud
     acc_cols = [c for c in df.columns if 'Acc' in c and '(' in c]
     if len(acc_cols) >= 3:
         df['Acc_Mag'] = np.sqrt(df[acc_cols[0]]**2 + df[acc_cols[1]]**2 + df[acc_cols[2]]**2)
@@ -101,7 +101,6 @@ elif target_group == "Ángulos de Inclinación (°)":
 else:
     selected_axes = [c for c in df.columns if 'H' in c and 'uT' in c]
 
-# Ocultar / Mostrar Ejes Dinámicamente
 st.sidebar.markdown("---")
 st.sidebar.subheader("👁️ Ocultar / Mostrar Ejes")
 visible_axes = st.sidebar.multiselect(
@@ -110,7 +109,6 @@ visible_axes = st.sidebar.multiselect(
     default=selected_axes
 )
 
-# Filtro de Suavizado y Gravedad
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎛️ Filtrado de Señal")
 apply_smoothing = st.sidebar.checkbox("Aplicar Media Móvil (Suavizado)", value=False)
@@ -118,16 +116,14 @@ window_size = st.sidebar.slider("Ventana de suavizado (muestras):", 3, 51, 9, st
 
 remove_gravity = st.sidebar.checkbox("Remover Gravedad en Z (Aceleración Dinámica)", value=False)
 
-# Configuración de Física y Fricción
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧲 Parámetros de Fricción y Deslizamiento")
 enable_physics_model = st.sidebar.checkbox("Activar Modelo de Fricción Dinámica", value=True)
 mu_s = st.sidebar.number_input("Coeficiente de Fricción Estático (µs):", value=0.28, step=0.01)
 safety_factor = st.sidebar.slider("Factor de Seguridad (%):", 50, 100, 80) / 100.0
 
-# Configuración de Umbrales Convencionales
 st.sidebar.markdown("---")
-st.sidebar.subheader("⚠️ Configuración de Umbrales Simples")
+st.sidebar.subheader("⚠️ Umbrales Convencionales")
 enable_upper = st.sidebar.checkbox("Activar Umbral Superior", value=True)
 upper_thresh = st.sidebar.number_input("Umbral Superior (|g|):", value=0.16, step=0.01) if enable_upper else None
 
@@ -137,7 +133,7 @@ lower_thresh = st.sidebar.number_input("Umbral Inferior (|g|):", value=-0.16, st
 min_distance_sec = st.sidebar.slider("Separación Mínima entre Eventos (s):", 0.1, 10.0, 1.0, 0.1)
 
 # ---------------------------------------------------------
-# PROCESAMIENTO DE SEÑALES Y CÁLCULOS FÍSICOS
+# PROCESAMIENTO DE SEÑALES Y CÁLCULOS FÍSICOS AVANZADOS
 # ---------------------------------------------------------
 plot_df = df.copy()
 
@@ -154,41 +150,46 @@ has_3d_acc = all([acc_x_col, acc_y_col, acc_z_col])
 if remove_gravity and acc_z_col:
     plot_df[acc_z_col] = plot_df[acc_z_col] - plot_df[acc_z_col].mean()
 
-# MODELO DE FÍSICA DE DESLIZAMIENTO
+# Paso del tiempo entre muestras
+dt_sample = plot_df['elapsed_sec'].diff().median()
+if pd.isna(dt_sample) or dt_sample <= 0:
+    dt_sample = 0.05
+fs = 1.0 / dt_sample if dt_sample > 0 else 0.0
+
+# MODELO DE FÍSICA: JERK, FRICCIÓN Y DESPLAZAMIENTO REAL
 if enable_physics_model and has_3d_acc:
-    # 1. Aceleración Horizontal Resultante en el Plano XY
-    plot_df['Acc_Horiz_XY'] = np.sqrt(plot_df[acc_x_col]**2 + plot_df[acc_y_col]**2)
-    
-    # 2. Fuerza Normal Dinámica considerando el Eje Z
+    # 1. Fuerza Normal Dinámica considerando la gravedad en Z
     acc_z_vals = plot_df[acc_z_col].values
     mean_z = np.mean(acc_z_vals)
     normal_g = acc_z_vals if mean_z > 0.5 else (1.0 + acc_z_vals)
-    normal_g = np.maximum(0.01, normal_g) # Prevenir división por cero
-    
+    normal_g = np.maximum(0.01, normal_g)
     plot_df['Normal_Force_g'] = normal_g
-    
-    # 3. Ratio de Riesgo de Deslizamiento R(t)
+
+    # 2. Aceleración Horizontal XY y Ratio R(t)
+    plot_df['Acc_Horiz_XY'] = np.sqrt(plot_df[acc_x_col]**2 + plot_df[acc_y_col]**2)
     plot_df['Slip_Risk_Ratio'] = plot_df['Acc_Horiz_XY'] / plot_df['Normal_Force_g']
-    
-    # 4. Aceleración Horizontal Máxima Permitida instante a instante
     plot_df['Acc_Max_Allowed'] = mu_s * plot_df['Normal_Force_g']
 
+    # 3. Cálculo de Jerk (Tasa de cambio de aceleración g/s)
+    plot_df['Jerk_XY'] = plot_df['Acc_Horiz_XY'].diff().fillna(0) / dt_sample
+
+    # 4. Aceleración Neta de Deslizamiento (Usando Coeficiente Dinámico µk ≈ 0.9 * µs)
+    mu_k = mu_s * 0.9
+    acc_net_g = np.maximum(0.0, plot_df['Acc_Horiz_XY'] - (mu_k * plot_df['Normal_Force_g']))
+    plot_df['Acc_Net_m_s2'] = acc_net_g * 9.81
+
 # ---------------------------------------------------------
-# ALGORITMO DE DETECCIÓN MULTIEJE Y DE DESLIZAMIENTO
+# ALGORITMO DE DETECCIÓN, DIAGNÓSTICO Y DESPLAZAMIENTO
 # ---------------------------------------------------------
-def detect_all_events(data_df, channels, upper=None, lower=None, min_dist_s=1.0, check_slip=False, mu_stat=0.28):
-    dt = data_df['elapsed_sec'].diff().median()
-    if pd.isna(dt) or dt <= 0:
-        dt = 0.05
+def detect_comprehensive_events(data_df, channels, upper=None, lower=None, min_dist_s=1.0, check_slip=False, mu_stat=0.28):
+    dt = data_df['elapsed_sec'].diff().median() or 0.05
     dist_samples = int(max(1, min_dist_s / dt))
-    
     events = []
     
-    # A) Detección de sobrepaso directo por eje
+    # A) Umbrales simples por eje
     for col in channels:
         if col not in data_df.columns:
             continue
-            
         if upper is not None:
             peaks, _ = find_peaks(data_df[col].values, height=upper, distance=dist_samples)
             for p in peaks:
@@ -199,34 +200,62 @@ def detect_all_events(data_df, channels, upper=None, lower=None, min_dist_s=1.0,
                     'Eje / Criterio': col,
                     'Tipo de Evento': 'Exceso Superior ↑',
                     'Valor Medido': round(data_df[col].iloc[p], 4),
-                    'Límite Establ.': upper
-                })
-                
-        if lower is not None:
-            peaks_low, _ = find_peaks(-data_df[col].values, height=-lower, distance=dist_samples)
-            for p in peaks_low:
-                events.append({
-                    'Índice': p,
-                    'Timestamp (ISO)': data_df['time'].iloc[p],
-                    'Tiempo Transcurrido (s)': round(data_df['elapsed_sec'].iloc[p], 3),
-                    'Eje / Criterio': col,
-                    'Tipo de Evento': 'Exceso Inferior ↓',
-                    'Valor Medido': round(data_df[col].iloc[p], 4),
-                    'Límite Establ.': lower
+                    'Límite Establ.': upper,
+                    'Jerk (g/s)': round(data_df['Jerk_XY'].iloc[p], 2) if 'Jerk_XY' in data_df.columns else 0.0,
+                    'Duración (ms)': "-",
+                    'Desplazamiento Est. (mm)': "-",
+                    'Diagnóstico Causa Raíz': "Exceso de Umbral Específico",
+                    'Efecto Estimado': "Sobrepaso de tolerancia por eje"
                 })
 
-    # B) Detección de Deslizamiento Físico (R >= mu_s)
+    # B) Evaluación Física de Deslizamiento
     if check_slip and 'Slip_Risk_Ratio' in data_df.columns:
         slip_peaks, _ = find_peaks(data_df['Slip_Risk_Ratio'].values, height=mu_stat, distance=dist_samples)
+        
         for p in slip_peaks:
+            # Duración del evento de sobrepaso continuo
+            start_p = p
+            while start_p > 0 and data_df['Slip_Risk_Ratio'].iloc[start_p] >= mu_stat:
+                start_p -= 1
+                
+            end_p = p
+            while end_p < len(data_df) - 1 and data_df['Slip_Risk_Ratio'].iloc[end_p] >= mu_stat:
+                end_p += 1
+                
+            duration_sec = (end_p - start_p) * dt
+            
+            # Integración de aceleración neta en el evento
+            segment_acc = data_df['Acc_Net_m_s2'].iloc[start_p:end_p+1]
+            avg_acc_net = segment_acc.mean() if len(segment_acc) > 0 else 0.0
+            
+            # Desplazamiento aproximado en mm (d = 0.5 * a * t^2)
+            disp_mm = 0.5 * avg_acc_net * (duration_sec ** 2) * 1000
+            
+            # Diagnóstico de Causa Raíz (Evaluando Z)
+            z_val = data_df['Normal_Force_g'].iloc[p]
+            cause = "⚠️ Pérdida de Carga (Z Baja / Brinco)" if z_val < 0.85 else "💥 Impacto Horizontal (XY / Frenada)"
+            
+            # Clasificación del efecto real
+            if disp_mm < 0.5:
+                efect = "🟢 Micro-vibración (Sin desplazamiento real)"
+            elif disp_mm < 5.0:
+                efect = "🟡 Desplazamiento Menor (< 5 mm)"
+            else:
+                efect = "🔴 DESPLAZAMIENTO CRÍTICO (> 5 mm)"
+
             events.append({
                 'Índice': p,
                 'Timestamp (ISO)': data_df['time'].iloc[p],
                 'Tiempo Transcurrido (s)': round(data_df['elapsed_sec'].iloc[p], 3),
-                'Eje / Criterio': '🚨 Deslizamiento Físico (XY / Normal Z)',
-                'Tipo de Evento': 'Riesgo R >= µs',
+                'Eje / Criterio': '🚨 Riesgo Deslizamiento R(t)',
+                'Tipo de Evento': f'R >= {mu_stat}',
                 'Valor Medido': round(data_df['Slip_Risk_Ratio'].iloc[p], 4),
-                'Límite Establ.': mu_stat
+                'Límite Establ.': mu_stat,
+                'Jerk (g/s)': round(data_df['Jerk_XY'].iloc[p], 2),
+                'Duración (ms)': round(duration_sec * 1000, 1),
+                'Desplazamiento Est. (mm)': round(disp_mm, 2),
+                'Diagnóstico Causa Raíz': cause,
+                'Efecto Estimado': efect
             })
             
     res_df = pd.DataFrame(events)
@@ -234,7 +263,7 @@ def detect_all_events(data_df, channels, upper=None, lower=None, min_dist_s=1.0,
         res_df = res_df.sort_values(by=['Tiempo Transcurrido (s)', 'Eje / Criterio']).reset_index(drop=True)
     return res_df
 
-events_df = detect_all_events(
+events_df = detect_comprehensive_events(
     plot_df, 
     channels=visible_axes, 
     upper=upper_thresh, 
@@ -245,13 +274,9 @@ events_df = detect_all_events(
 )
 
 # ---------------------------------------------------------
-# PANELES DE MÉTRICAS Y KPIS CON RANGOS
+# PANELES DE MÉTRICAS Y KPIS
 # ---------------------------------------------------------
-# Cálculo preventivo de frecuencia de muestreo (fs) para evitar NameError
-dt_sample = df['elapsed_sec'].diff().median()
-fs = 1.0 / dt_sample if (pd.notna(dt_sample) and dt_sample > 0) else 0.0
-
-st.markdown("### 📊 Estado General de Traza y Fricción")
+st.markdown("### 📊 Estado General de Traza, Fricción y Dinámica")
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("⏱️ Muestras / Frecuencia", f"{len(df):,} pts", f"{fs:.1f} Hz")
@@ -261,12 +286,13 @@ if enable_physics_model and has_3d_acc:
     r_min = plot_df['Slip_Risk_Ratio'].min()
     r_max = plot_df['Slip_Risk_Ratio'].max()
     slips_count = (plot_df['Slip_Risk_Ratio'] >= mu_s).sum()
+    max_jerk = plot_df['Jerk_XY'].abs().max()
     
     c3.metric("📐 Rango de Riesgo (R)", f"{r_min:.2f} a {r_max:.2f}")
     c4.metric("💥 Riesgo Pico (R_max)", f"{r_max:.3f}", f"{'DESLIZAMIENTO' if r_max >= mu_s else 'OK'}")
-    c5.metric("🚨 Eventos Registrados", f"{len(events_df)}", f"{slips_count} por Fricción", delta_color="inverse")
+    c5.metric("🔨 Jerk Máximo", f"{max_jerk:.1f} g/s", f"{len(events_df)} Eventos", delta_color="inverse")
 
-    # Distribución porcentual por zonas
+    # Distribución por Zonas
     safe_pct = (plot_df['Slip_Risk_Ratio'] < (mu_s * safety_factor)).mean() * 100
     warn_pct = ((plot_df['Slip_Risk_Ratio'] >= (mu_s * safety_factor)) & (plot_df['Slip_Risk_Ratio'] < mu_s)).mean() * 100
     crit_pct = (plot_df['Slip_Risk_Ratio'] >= mu_s).mean() * 100
@@ -290,7 +316,7 @@ st.markdown("---")
 # ---------------------------------------------------------
 tab_plot, tab_events, tab_fft, tab_stats = st.tabs([
     "📊 Gráfica Interactiva", 
-    "🚨 Registros de Thresholds y Deslizamiento", 
+    "🚨 Registros de Eventos y Desplazamiento", 
     "⚡ Análisis de Frecuencia (FFT)", 
     "📋 Estadísticas Descriptivas"
 ])
@@ -307,8 +333,9 @@ with tab_plot:
     
     if selected_event is not None:
         st.info(
-            f"📍 **Evento Seleccionado:** **{selected_event['Eje / Criterio']}** en t = **{selected_event['Tiempo Transcurrido (s)']} s** "
-            f"(Valor Medido: **{selected_event['Valor Medido']}** | Tipo: **{selected_event['Tipo de Evento']}**)"
+            f"📍 **Evento Seleccionado:** **{selected_event['Eje / Criterio']}** en t = **{selected_event['Tiempo Transcurrido (s)']} s** | "
+            f"Diagnóstico: **{selected_event['Diagnóstico Causa Raíz']}** | "
+            f"Desplazamiento Est.: **{selected_event['Desplazamiento Est. (mm)']} mm**"
         )
     
     fig = go.Figure()
@@ -374,14 +401,14 @@ with tab_plot:
             mode='markers',
             name='Eventos Detectados',
             marker=dict(symbol='x', size=8, color='red', line=dict(width=1.5)),
-            hovertext=events_df['Eje / Criterio'],
+            hovertext=events_df['Diagnóstico Causa Raíz'],
             hovertemplate='<b>EVENTO DETECTADO</b><br><b>Criterio:</b> %{hovertext}<br><b>Tiempo:</b> %{x:.2f} s<br><b>Valor:</b> %{y:.4f}<extra></extra>'
         ))
 
-    # Marcador del Evento Seleccionado en la Tabla
+    # Marcador del Evento Seleccionado
     if selected_event is not None:
         selected_time = selected_event['Tiempo Transcurrido (s)']
-        selected_val = selected_event['Valor Medido']
+        selected_val = selected_event['Valor Medido'] if isinstance(selected_event['Valor Medido'], (int, float)) else 0.0
 
         fig.add_vline(x=selected_time, line_width=2, line_dash="dot", line_color="gold")
         fig.add_trace(go.Scatter(
@@ -403,18 +430,18 @@ with tab_plot:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# 2. PESTAÑA DE REGISTROS DE THRESHOLDS Y DESLIZAMIENTO
+# 2. PESTAÑA DE REGISTROS DE EVENTOS Y DESPLAZAMIENTO
 with tab_events:
-    st.subheader("🚨 Marcas de Tiempo de Umbrales y Deslizamiento")
+    st.subheader("🚨 Diagnóstico de Eventos, Jerk y Desplazamiento Real")
     
     if events_df.empty:
         st.info("No se registraron eventos que violen los umbrales ni las condiciones de fricción.")
     else:
-        st.write(f"Se contabilizan **{len(events_df)}** eventos en la traza actual:")
-        st.caption("👈 **Haz clic en cualquier fila de la tabla** para ubicar y resaltar el instante en la gráfica interactiva.")
+        st.write(f"Se contabilizan **{len(events_df)}** eventos evaluados por el modelo físico:")
+        st.caption("👈 **Haz clic en cualquier fila de la tabla** para ubicar y resaltar el punto en la gráfica interactiva.")
         
         event_selection = st.dataframe(
-            events_df[['Índice', 'Timestamp (ISO)', 'Tiempo Transcurrido (s)', 'Eje / Criterio', 'Tipo de Evento', 'Valor Medido', 'Límite Establ.']],
+            events_df[['Tiempo Transcurrido (s)', 'Eje / Criterio', 'Valor Medido', 'Jerk (g/s)', 'Duración (ms)', 'Desplazamiento Est. (mm)', 'Diagnóstico Causa Raíz', 'Efecto Estimado']],
             use_container_width=True,
             on_select="rerun",
             selection_mode="single-row",
@@ -427,9 +454,9 @@ with tab_events:
 
         csv_events = events_df.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="📥 Descargar Registro de Eventos (CSV)",
+            label="📥 Descargar Diagnóstico de Eventos (CSV)",
             data=csv_events,
-            file_name="threshold_and_slip_events.csv",
+            file_name="displacement_and_slip_events.csv",
             mime="text/csv"
         )
 
