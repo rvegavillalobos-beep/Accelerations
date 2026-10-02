@@ -96,8 +96,6 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("👁️ Hide / Show Axes")
-
-# Ocultar Acc_Mag / Magnitudes por defecto
 default_axes = [c for c in selected_axes if 'mag' not in c.lower()]
 
 visible_axes = st.sidebar.multiselect(
@@ -119,6 +117,11 @@ enable_physics_model = st.sidebar.checkbox("Enable Dynamic Friction Model", valu
 mu_s = st.sidebar.number_input("Static Friction Coefficient (µs):", value=0.28, step=0.01)
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("🔨 Jerk Detection")
+enable_jerk_detection = st.sidebar.checkbox("Detect High Jerk Events", value=True)
+jerk_threshold = st.sidebar.number_input("Jerk Threshold (g/s):", value=3.0, step=0.5) if enable_jerk_detection else None
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("⚠️ Conventional Thresholds")
 enable_upper = st.sidebar.checkbox("Enable Upper Threshold", value=True)
 upper_thresh = st.sidebar.number_input("Upper Threshold (|g|):", value=0.16, step=0.01) if enable_upper else None
@@ -129,7 +132,7 @@ lower_thresh = st.sidebar.number_input("Lower Threshold (|g|):", value=-0.16, st
 min_distance_sec = st.sidebar.slider("Minimum Event Separation (s):", 0.1, 10.0, 1.0, 0.1)
 
 # ---------------------------------------------------------
-# CÁLCULOS FÍSICOS
+# CÁLCULOS FÍSICOS Y JERK
 # ---------------------------------------------------------
 plot_df = df.copy()
 
@@ -150,6 +153,11 @@ if pd.isna(dt_sample) or dt_sample <= 0:
     dt_sample = 0.05
 fs = 1.0 / dt_sample if dt_sample > 0 else 0.0
 
+if has_3d_acc:
+    plot_df['Acc_Horiz_XY'] = np.sqrt(plot_df[acc_x_col]**2 + plot_df[acc_y_col]**2)
+    # Cálculo de Jerk en g/s
+    plot_df['Jerk_XY'] = plot_df['Acc_Horiz_XY'].diff().abs().fillna(0) / dt_sample
+
 if enable_physics_model and has_3d_acc:
     acc_z_vals = plot_df[acc_z_col].values
     mean_z = np.mean(acc_z_vals)
@@ -157,24 +165,22 @@ if enable_physics_model and has_3d_acc:
     normal_g = np.maximum(0.01, normal_g)
     plot_df['Normal_Force_g'] = normal_g
 
-    plot_df['Acc_Horiz_XY'] = np.sqrt(plot_df[acc_x_col]**2 + plot_df[acc_y_col]**2)
     plot_df['Slip_Risk_Ratio'] = plot_df['Acc_Horiz_XY'] / plot_df['Normal_Force_g']
     plot_df['Acc_Max_Allowed'] = mu_s * plot_df['Normal_Force_g']
-
-    plot_df['Jerk_XY'] = plot_df['Acc_Horiz_XY'].diff().fillna(0) / dt_sample
 
     mu_k = mu_s * 0.9
     acc_net_g = np.maximum(0.0, plot_df['Acc_Horiz_XY'] - (mu_k * plot_df['Normal_Force_g']))
     plot_df['Acc_Net_m_s2'] = acc_net_g * 9.81
 
 # ---------------------------------------------------------
-# ALGORITMO DE DETECCIÓN
+# DETECCIÓN DE EVENTOS MULTI-CRITERIO
 # ---------------------------------------------------------
-def detect_comprehensive_events(data_df, channels, upper=None, lower=None, min_dist_s=1.0, check_slip=False, mu_stat=0.28):
+def detect_comprehensive_events(data_df, channels, upper=None, lower=None, min_dist_s=1.0, check_slip=False, mu_stat=0.28, jerk_lim=None):
     dt = data_df['elapsed_sec'].diff().median() or 0.05
     dist_samples = int(max(1, min_dist_s / dt))
     events = []
     
+    # 1. Umbrales por eje
     for col in channels:
         if col not in data_df.columns:
             continue
@@ -192,34 +198,50 @@ def detect_comprehensive_events(data_df, channels, upper=None, lower=None, min_d
                     'Jerk (g/s)': round(data_df['Jerk_XY'].iloc[p], 2) if 'Jerk_XY' in data_df.columns else 0.0,
                     'Duration (ms)': "-",
                     'Est. Displacement (mm)': "-",
-                    'Root Cause Diagnosis': "Specific Threshold Exceeded",
-                    'Estimated Effect': "Axis tolerance threshold breach"
+                    'Root Cause Diagnosis': "Threshold Breach",
+                    'Estimated Effect': "Axis acceleration limit exceeded"
                 })
 
+    # 2. Eventos específicos de Jerk
+    if jerk_lim is not None and 'Jerk_XY' in data_df.columns:
+        jerk_peaks, _ = find_peaks(data_df['Jerk_XY'].values, height=jerk_lim, distance=dist_samples)
+        for p in jerk_peaks:
+            events.append({
+                'Index': p,
+                'Timestamp (ISO)': data_df['time'].iloc[p],
+                'Elapsed Time (s)': round(data_df['elapsed_sec'].iloc[p], 3),
+                'Axis / Criterion': '⚡ Jerk (XY)',
+                'Event Type': f'Jerk >= {jerk_lim} g/s',
+                'Measured Value': round(data_df['Jerk_XY'].iloc[p], 2),
+                'Set Limit': jerk_lim,
+                'Jerk (g/s)': round(data_df['Jerk_XY'].iloc[p], 2),
+                'Duration (ms)': "-",
+                'Est. Displacement (mm)': "-",
+                'Root Cause Diagnosis': "💥 Mechanical Impact / Sudden Jerk",
+                'Estimated Effect': "High instantaneous force gradient (Potential slip initiation)"
+            })
+
+    # 3. Eventos de deslizamiento físico
     if check_slip and 'Slip_Risk_Ratio' in data_df.columns:
         slip_peaks, _ = find_peaks(data_df['Slip_Risk_Ratio'].values, height=mu_stat, distance=dist_samples)
-        
         for p in slip_peaks:
             start_p = p
             while start_p > 0 and data_df['Slip_Risk_Ratio'].iloc[start_p] >= mu_stat:
                 start_p -= 1
-                
             end_p = p
             while end_p < len(data_df) - 1 and data_df['Slip_Risk_Ratio'].iloc[end_p] >= mu_stat:
                 end_p += 1
                 
             duration_sec = (end_p - start_p) * dt
-            
             segment_acc = data_df['Acc_Net_m_s2'].iloc[start_p:end_p+1]
             avg_acc_net = segment_acc.mean() if len(segment_acc) > 0 else 0.0
-            
             disp_mm = 0.5 * avg_acc_net * (duration_sec ** 2) * 1000
             
             z_val = data_df['Normal_Force_g'].iloc[p]
             cause = "⚠️ Load Loss (Low Z / Bounce)" if z_val < 0.85 else "💥 Horizontal Impact (XY / Braking)"
             
             if disp_mm < 0.5:
-                efect = "🟢 Micro-vibration (No real displacement)"
+                efect = "🟢 Micro-vibration"
             elif disp_mm < 5.0:
                 efect = "🟡 Minor Displacement (< 5 mm)"
             else:
@@ -252,7 +274,8 @@ events_df = detect_comprehensive_events(
     lower=lower_thresh, 
     min_dist_s=min_distance_sec,
     check_slip=(enable_physics_model and has_3d_acc),
-    mu_stat=mu_s
+    mu_stat=mu_s,
+    jerk_lim=jerk_threshold
 )
 
 # ---------------------------------------------------------
@@ -266,6 +289,7 @@ tab_plot, tab_events = st.tabs([
     "🚨 Event & Displacement Log"
 ])
 
+# Obtener evento seleccionado desde la tabla
 selected_event = None
 if 'selected_event_idx' in st.session_state and not events_df.empty:
     idx = st.session_state['selected_event_idx']
@@ -275,11 +299,18 @@ if 'selected_event_idx' in st.session_state and not events_df.empty:
 with tab_plot:
     st.subheader(f"Signal Visualization: {target_group}")
     
+    # Controles adicionales del gráfico
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        auto_zoom = st.checkbox("🔍 Auto-zoom on selected event (±2s window)", value=True)
+    with col_c2:
+        show_jerk_trace = st.checkbox("Show Jerk Signal (Jerk_XY) on Plot", value=False)
+
     if selected_event is not None:
         st.info(
             f"📍 **Selected Event:** **{selected_event['Axis / Criterion']}** at t = **{selected_event['Elapsed Time (s)']} s** | "
-            f"Diagnosis: **{selected_event['Root Cause Diagnosis']}** | "
-            f"Est. Displacement: **{selected_event['Est. Displacement (mm)']} mm**"
+            f"Value: **{selected_event['Measured Value']}** | Jerk: **{selected_event['Jerk (g/s)']} g/s** | "
+            f"Diagnosis: **{selected_event['Root Cause Diagnosis']}**"
         )
     
     fig = go.Figure()
@@ -306,8 +337,18 @@ with tab_plot:
             hovertemplate='<b>Axis:</b> ' + axis_col + '<br><b>Time:</b> %{x:.2f} s<br><b>Value:</b> %{y:.4f}<extra></extra>'
         ))
 
+    # Trazado opcional de Jerk en la gráfica
+    if show_jerk_trace and 'Jerk_XY' in plot_df.columns:
+        fig.add_trace(go.Scatter(
+            x=plot_df['elapsed_sec'],
+            y=plot_df['Jerk_XY'],
+            mode='lines',
+            name='Jerk XY (g/s)',
+            line=dict(width=1.5, color='purple', dash='dot'),
+            hovertemplate='<b>Jerk:</b> %{y:.2f} g/s<extra></extra>'
+        ))
+
     if enable_physics_model and has_3d_acc and target_group == "Acceleration (g)":
-        # Activada por defecto la señal vector XY en negro (value=True)
         show_vector_xy = st.checkbox("Show Resultant Horizontal Acceleration (Acc_Horiz_XY)", value=True)
         show_allowed_limit = st.checkbox("Show Dynamic Friction Limit (Acc_Max_Allowed)", value=True)
         
@@ -336,6 +377,7 @@ with tab_plot:
     if lower_thresh is not None:
         fig.add_hline(y=lower_thresh, line_dash="dash", line_color="royalblue", annotation_text=f"-Threshold ({lower_thresh})")
 
+    # Marcar todos los eventos detectados
     if not events_df.empty:
         fig.add_trace(go.Scatter(
             x=events_df['Elapsed Time (s)'],
@@ -347,19 +389,24 @@ with tab_plot:
             hovertemplate='<b>DETECTED EVENT</b><br><b>Criterion:</b> %{hovertext}<br><b>Time:</b> %{x:.2f} s<br><b>Value:</b> %{y:.4f}<extra></extra>'
         ))
 
+    # Resaltado y Auto-Zoom del evento seleccionado
     if selected_event is not None:
         selected_time = selected_event['Elapsed Time (s)']
         selected_val = selected_event['Measured Value'] if isinstance(selected_event['Measured Value'], (int, float)) else 0.0
 
-        fig.add_vline(x=selected_time, line_width=2, line_dash="dot", line_color="gold")
+        fig.add_vline(x=selected_time, line_width=2.5, line_dash="dash", line_color="gold")
         fig.add_trace(go.Scatter(
             x=[selected_time],
             y=[selected_val],
             mode='markers',
-            name='Selected',
-            marker=dict(symbol='cross', size=14, color='yellow', line=dict(width=2, color='black')),
+            name='Selected Event',
+            marker=dict(symbol='star', size=16, color='yellow', line=dict(width=2, color='black')),
             hoverinfo='skip'
         ))
+
+        # Enfoque automático del rango X al evento seleccionado (±2 segundos)
+        if auto_zoom:
+            fig.update_xaxes(range=[max(0, selected_time - 2.0), selected_time + 2.0])
 
     fig.update_layout(
         xaxis_title="Elapsed Time (seconds)",
@@ -375,10 +422,10 @@ with tab_events:
     st.subheader("🚨 Event Diagnostics, Jerk & Real Displacement")
     
     if events_df.empty:
-        st.info("No events violating thresholds or friction conditions were detected.")
+        st.info("No events violating thresholds, Jerk limits, or friction conditions were detected.")
     else:
         st.write(f"Recorded **{len(events_df)}** events evaluated by the physical model:")
-        st.caption("👈 **Click on any row in the table** to locate and highlight the point on the interactive chart.")
+        st.caption("👈 **Selecciona una fila de la tabla** para enfocar y hacer Zoom automático sobre ese evento en la gráfica.")
         
         event_selection = st.dataframe(
             events_df[['Elapsed Time (s)', 'Axis / Criterion', 'Measured Value', 'Jerk (g/s)', 'Duration (ms)', 'Est. Displacement (mm)', 'Root Cause Diagnosis', 'Estimated Effect']],
