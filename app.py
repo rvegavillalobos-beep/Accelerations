@@ -29,10 +29,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Brief descriptive title
-st.title("📈 Measurement Processor")
-st.caption("Friction evaluation, Jerk impact analysis, displacement estimation, and root-cause diagnostics.")
-
 # ---------------------------------------------------------
 # DATA LOADING AND PREPROCESSING
 # ---------------------------------------------------------
@@ -104,10 +100,14 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("👁️ Hide / Show Axes")
+
+# Ocultar magnitudes (ej. Acc_Mag) por defecto en la selección inicial
+default_axes = [c for c in selected_axes if 'mag' not in c.lower()]
+
 visible_axes = st.sidebar.multiselect(
     "Visible axes on plot:",
     options=selected_axes,
-    default=selected_axes
+    default=default_axes
 )
 
 st.sidebar.markdown("---")
@@ -122,7 +122,6 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🧲 Friction & Slip Parameters")
 enable_physics_model = st.sidebar.checkbox("Enable Dynamic Friction Model", value=True)
 mu_s = st.sidebar.number_input("Static Friction Coefficient (µs):", value=0.28, step=0.01)
-safety_factor = st.sidebar.slider("Safety Factor (%):", 50, 100, 80) / 100.0
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("⚠️ Conventional Thresholds")
@@ -143,7 +142,6 @@ if apply_smoothing:
     for col in selected_axes:
         plot_df[col] = plot_df[col].rolling(window=window_size, center=True).mean().bfill().ffill()
 
-# Intelligent identification of triaxial X, Y, Z columns
 acc_x_col = next((c for c in plot_df.columns if 'acc' in c.lower() and 'x' in c.lower()), None)
 acc_y_col = next((c for c in plot_df.columns if 'acc' in c.lower() and 'y' in c.lower()), None)
 acc_z_col = next((c for c in plot_df.columns if 'acc' in c.lower() and 'z' in c.lower()), None)
@@ -152,43 +150,36 @@ has_3d_acc = all([acc_x_col, acc_y_col, acc_z_col])
 if remove_gravity and acc_z_col:
     plot_df[acc_z_col] = plot_df[acc_z_col] - plot_df[acc_z_col].mean()
 
-# Sample time step
 dt_sample = plot_df['elapsed_sec'].diff().median()
 if pd.isna(dt_sample) or dt_sample <= 0:
     dt_sample = 0.05
 fs = 1.0 / dt_sample if dt_sample > 0 else 0.0
 
-# PHYSICAL MODEL: JERK, FRICTION, AND REAL DISPLACEMENT
 if enable_physics_model and has_3d_acc:
-    # 1. Dynamic Normal Force considering gravity on Z
     acc_z_vals = plot_df[acc_z_col].values
     mean_z = np.mean(acc_z_vals)
     normal_g = acc_z_vals if mean_z > 0.5 else (1.0 + acc_z_vals)
     normal_g = np.maximum(0.01, normal_g)
     plot_df['Normal_Force_g'] = normal_g
 
-    # 2. Horizontal XY Acceleration and Risk Ratio R(t)
     plot_df['Acc_Horiz_XY'] = np.sqrt(plot_df[acc_x_col]**2 + plot_df[acc_y_col]**2)
     plot_df['Slip_Risk_Ratio'] = plot_df['Acc_Horiz_XY'] / plot_df['Normal_Force_g']
     plot_df['Acc_Max_Allowed'] = mu_s * plot_df['Normal_Force_g']
 
-    # 3. Jerk calculation (Rate of acceleration change in g/s)
     plot_df['Jerk_XY'] = plot_df['Acc_Horiz_XY'].diff().fillna(0) / dt_sample
 
-    # 4. Net Slip Acceleration (Using Dynamic Coefficient µk ≈ 0.9 * µs)
     mu_k = mu_s * 0.9
     acc_net_g = np.maximum(0.0, plot_df['Acc_Horiz_XY'] - (mu_k * plot_df['Normal_Force_g']))
     plot_df['Acc_Net_m_s2'] = acc_net_g * 9.81
 
 # ---------------------------------------------------------
-# DETECTION ALGORITHM & DISPLACEMENT DIAGNOSTICS
+# DETECTION ALGORITHM
 # ---------------------------------------------------------
 def detect_comprehensive_events(data_df, channels, upper=None, lower=None, min_dist_s=1.0, check_slip=False, mu_stat=0.28):
     dt = data_df['elapsed_sec'].diff().median() or 0.05
     dist_samples = int(max(1, min_dist_s / dt))
     events = []
     
-    # A) Simple threshold checks per axis
     for col in channels:
         if col not in data_df.columns:
             continue
@@ -210,12 +201,10 @@ def detect_comprehensive_events(data_df, channels, upper=None, lower=None, min_d
                     'Estimated Effect': "Axis tolerance threshold breach"
                 })
 
-    # B) Physical Slip Evaluation
     if check_slip and 'Slip_Risk_Ratio' in data_df.columns:
         slip_peaks, _ = find_peaks(data_df['Slip_Risk_Ratio'].values, height=mu_stat, distance=dist_samples)
         
         for p in slip_peaks:
-            # Event duration over threshold
             start_p = p
             while start_p > 0 and data_df['Slip_Risk_Ratio'].iloc[start_p] >= mu_stat:
                 start_p -= 1
@@ -226,18 +215,14 @@ def detect_comprehensive_events(data_df, channels, upper=None, lower=None, min_d
                 
             duration_sec = (end_p - start_p) * dt
             
-            # Net acceleration integration during event
             segment_acc = data_df['Acc_Net_m_s2'].iloc[start_p:end_p+1]
             avg_acc_net = segment_acc.mean() if len(segment_acc) > 0 else 0.0
             
-            # Approximate displacement in mm (d = 0.5 * a * t^2)
             disp_mm = 0.5 * avg_acc_net * (duration_sec ** 2) * 1000
             
-            # Root cause diagnosis (evaluating Z force)
             z_val = data_df['Normal_Force_g'].iloc[p]
             cause = "⚠️ Load Loss (Low Z / Bounce)" if z_val < 0.85 else "💥 Horizontal Impact (XY / Braking)"
             
-            # Effect classification
             if disp_mm < 0.5:
                 efect = "🟢 Micro-vibration (No real displacement)"
             elif disp_mm < 5.0:
@@ -276,46 +261,14 @@ events_df = detect_comprehensive_events(
 )
 
 # ---------------------------------------------------------
-# METRIC PANELS & KPIS
+# MAIN LAYOUT
 # ---------------------------------------------------------
-st.markdown("### 📊 Trace Status, Friction & Dynamics Overview")
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("⏱️ Samples / Frequency", f"{len(df):,} pts", f"{fs:.1f} Hz")
-c2.metric("⌛ Total Duration", f"{df['elapsed_sec'].iloc[-1]/60:.1f} min")
+# 1. TÍTULO Y DESCRIPCIÓN
+st.title("📈 Measurement Processor")
+st.caption("Friction evaluation, Jerk impact analysis, displacement estimation, and root-cause diagnostics.")
 
-if enable_physics_model and has_3d_acc:
-    r_min = plot_df['Slip_Risk_Ratio'].min()
-    r_max = plot_df['Slip_Risk_Ratio'].max()
-    slips_count = (plot_df['Slip_Risk_Ratio'] >= mu_s).sum()
-    max_jerk = plot_df['Jerk_XY'].abs().max()
-    
-    c3.metric("📐 Risk Range (R)", f"{r_min:.2f} to {r_max:.2f}")
-    c4.metric("💥 Peak Risk (R_max)", f"{r_max:.3f}", f"{'SLIP' if r_max >= mu_s else 'OK'}")
-    c5.metric("🔨 Maximum Jerk", f"{max_jerk:.1f} g/s", f"{len(events_df)} Events", delta_color="inverse")
-
-    # Zone distribution
-    safe_pct = (plot_df['Slip_Risk_Ratio'] < (mu_s * safety_factor)).mean() * 100
-    warn_pct = ((plot_df['Slip_Risk_Ratio'] >= (mu_s * safety_factor)) & (plot_df['Slip_Risk_Ratio'] < mu_s)).mean() * 100
-    crit_pct = (plot_df['Slip_Risk_Ratio'] >= mu_s).mean() * 100
-
-    st.markdown("**Trace Time Distribution by Risk Range:**")
-    col_s, col_w, col_c = st.columns(3)
-    col_s.caption(f"🟢 **Safe (R < {mu_s * safety_factor:.2f}):** {safe_pct:.1f}% of time")
-    col_w.caption(f"🟡 **Warning ({mu_s * safety_factor:.2f} ≤ R < {mu_s:.2f}):** {warn_pct:.1f}% of time")
-    col_c.caption(f"🔴 **Slip (R ≥ {mu_s:.2f}):** {crit_pct:.1f}% of time")
-else:
-    c3.metric("🎯 Thresholds Exceeded", f"{len(events_df)} events")
-    max_v = plot_df[visible_axes].max().max() if visible_axes else 0.0
-    min_v = plot_df[visible_axes].min().min() if visible_axes else 0.0
-    c4.metric("🚀 Peak Maximum", f"{max_v:.3f}")
-    c5.metric("📉 Minimum", f"{min_v:.3f}")
-
-st.markdown("---")
-
-# ---------------------------------------------------------
-# TABS STRUCTURE (FFT AND STATISTICS REMOVED)
-# ---------------------------------------------------------
+# 2. EL GRÁFICO E INTERFAZ PRINCIPAL PRIMERO
 tab_plot, tab_events = st.tabs([
     "📊 Interactive Chart", 
     "🚨 Event & Displacement Log"
@@ -327,7 +280,6 @@ if 'selected_event_idx' in st.session_state and not events_df.empty:
     if idx < len(events_df):
         selected_event = events_df.iloc[idx]
 
-# 1. INTERACTIVE PLOT TAB
 with tab_plot:
     st.subheader(f"Signal Visualization: {target_group}")
     
@@ -362,9 +314,7 @@ with tab_plot:
             hovertemplate='<b>Axis:</b> ' + axis_col + '<br><b>Time:</b> %{x:.2f} s<br><b>Value:</b> %{y:.4f}<extra></extra>'
         ))
 
-    # Additional dynamic friction curves
     if enable_physics_model and has_3d_acc and target_group == "Acceleration (g)":
-        # Vector Magnitude disabled by default
         show_vector_xy = st.checkbox("Show Resultant Horizontal Acceleration (Acc_Horiz_XY)", value=False)
         show_allowed_limit = st.checkbox("Show Dynamic Friction Limit (Acc_Max_Allowed)", value=True)
         
@@ -388,13 +338,11 @@ with tab_plot:
                 hovertemplate='<b>Friction Limit:</b> %{y:.4f} g<extra></extra>'
             ))
 
-    # Fixed threshold lines
     if upper_thresh is not None:
         fig.add_hline(y=upper_thresh, line_dash="dash", line_color="crimson", annotation_text=f"+Threshold ({upper_thresh})")
     if lower_thresh is not None:
         fig.add_hline(y=lower_thresh, line_dash="dash", line_color="royalblue", annotation_text=f"-Threshold ({lower_thresh})")
 
-    # Mark events
     if not events_df.empty:
         fig.add_trace(go.Scatter(
             x=events_df['Elapsed Time (s)'],
@@ -406,7 +354,6 @@ with tab_plot:
             hovertemplate='<b>DETECTED EVENT</b><br><b>Criterion:</b> %{hovertext}<br><b>Time:</b> %{x:.2f} s<br><b>Value:</b> %{y:.4f}<extra></extra>'
         ))
 
-    # Selected event highlight marker
     if selected_event is not None:
         selected_time = selected_event['Elapsed Time (s)']
         selected_val = selected_event['Measured Value'] if isinstance(selected_event['Measured Value'], (int, float)) else 0.0
@@ -431,7 +378,6 @@ with tab_plot:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# 2. EVENT DIAGNOSTICS & DISPLACEMENT TAB
 with tab_events:
     st.subheader("🚨 Event Diagnostics, Jerk & Real Displacement")
     
@@ -460,3 +406,26 @@ with tab_events:
             file_name="displacement_and_slip_events.csv",
             mime="text/csv"
         )
+
+# 3. MÉTRICAS Y RESUMEN AL FINAL
+st.markdown("---")
+st.markdown("### 📊 Trace Status & Dynamics Overview")
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("⏱️ Samples / Frequency", f"{len(df):,} pts", f"{fs:.1f} Hz")
+c2.metric("⌛ Total Duration", f"{df['elapsed_sec'].iloc[-1]/60:.1f} min")
+
+if enable_physics_model and has_3d_acc:
+    r_min = plot_df['Slip_Risk_Ratio'].min()
+    r_max = plot_df['Slip_Risk_Ratio'].max()
+    max_jerk = plot_df['Jerk_XY'].abs().max()
+    
+    c3.metric("📐 Risk Range (R)", f"{r_min:.2f} to {r_max:.2f}")
+    c4.metric("💥 Peak Risk (R_max)", f"{r_max:.3f}", f"{'SLIP' if r_max >= mu_s else 'OK'}")
+    c5.metric("🔨 Maximum Jerk", f"{max_jerk:.1f} g/s", f"{len(events_df)} Events", delta_color="inverse")
+else:
+    c3.metric("🎯 Thresholds Exceeded", f"{len(events_df)} events")
+    max_v = plot_df[visible_axes].max().max() if visible_axes else 0.0
+    min_v = plot_df[visible_axes].min().min() if visible_axes else 0.0
+    c4.metric("🚀 Peak Maximum", f"{max_v:.3f}")
+    c5.metric("📉 Minimum", f"{min_v:.3f}")
