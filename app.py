@@ -6,7 +6,7 @@ from scipy.signal import find_peaks
 import io
 
 # ---------------------------------------------------------
-# PAGE CONFIGURATION & STYLES
+# CONFIGURACIÓN Y ESTILOS
 # ---------------------------------------------------------
 st.set_page_config(
     page_title="Measurement Processor",
@@ -30,7 +30,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# DATA LOADING AND PREPROCESSING
+# CARGA Y PREPROCESAMIENTO DE DATOS
 # ---------------------------------------------------------
 @st.cache_data
 def load_and_preprocess_data(file_bytes_or_path):
@@ -43,7 +43,6 @@ def load_and_preprocess_data(file_bytes_or_path):
 
     df.columns = df.columns.str.strip()
 
-    # Time processing
     if 'time' in df.columns:
         df['datetime'] = pd.to_datetime(df['time'], errors='coerce')
         df['elapsed_sec'] = (df['datetime'] - df['datetime'].iloc[0]).dt.total_seconds()
@@ -51,12 +50,10 @@ def load_and_preprocess_data(file_bytes_or_path):
         df['elapsed_sec'] = np.arange(len(df)) * 0.05
         df['time'] = df['elapsed_sec'].astype(str) + " s"
 
-    # Accelerometer magnitude mapping
     acc_cols = [c for c in df.columns if 'Acc' in c and '(' in c]
     if len(acc_cols) >= 3:
         df['Acc_Mag'] = np.sqrt(df[acc_cols[0]]**2 + df[acc_cols[1]]**2 + df[acc_cols[2]]**2)
     
-    # Gyroscope magnitude mapping
     gyro_cols = [c for c in df.columns if 'As' in c and '(' in c]
     if len(gyro_cols) >= 3:
         df['Gyro_Mag'] = np.sqrt(df[gyro_cols[0]]**2 + df[gyro_cols[1]]**2 + df[gyro_cols[2]]**2)
@@ -64,7 +61,7 @@ def load_and_preprocess_data(file_bytes_or_path):
     return df
 
 # ---------------------------------------------------------
-# SIDEBAR (CONTROLS & CONFIGURATION)
+# SIDEBAR (CONTROLES Y CONFIGURACIÓN)
 # ---------------------------------------------------------
 st.sidebar.header("⚙️ Configuration & Filters")
 
@@ -83,7 +80,6 @@ else:
         st.warning("Please upload a trace file to begin.")
         st.stop()
 
-# Variable group selection
 target_group = st.sidebar.radio(
     "Variable Group to Analyze:",
     ["Acceleration (g)", "Angular Velocity (°/s)", "Inclination Angles (°)", "Magnetometer (uT)"]
@@ -101,7 +97,7 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.subheader("👁️ Hide / Show Axes")
 
-# Ocultar magnitudes (ej. Acc_Mag) por defecto en la selección inicial
+# Ocultar Acc_Mag / Magnitudes por defecto
 default_axes = [c for c in selected_axes if 'mag' not in c.lower()]
 
 visible_axes = st.sidebar.multiselect(
@@ -115,7 +111,6 @@ st.sidebar.subheader("🎛️ Signal Filtering")
 apply_smoothing = st.sidebar.checkbox("Apply Moving Average (Smoothing)", value=False)
 window_size = st.sidebar.slider("Smoothing Window (samples):", 3, 51, 9, step=2) if apply_smoothing else 1
 
-# Gravity removal enabled by default
 remove_gravity = st.sidebar.checkbox("Remove Gravity from Z (Dynamic Acceleration)", value=True)
 
 st.sidebar.markdown("---")
@@ -134,7 +129,7 @@ lower_thresh = st.sidebar.number_input("Lower Threshold (|g|):", value=-0.16, st
 min_distance_sec = st.sidebar.slider("Minimum Event Separation (s):", 0.1, 10.0, 1.0, 0.1)
 
 # ---------------------------------------------------------
-# SIGNAL PROCESSING & PHYSICAL CALCULATIONS
+# CÁLCULOS FÍSICOS
 # ---------------------------------------------------------
 plot_df = df.copy()
 
@@ -173,7 +168,7 @@ if enable_physics_model and has_3d_acc:
     plot_df['Acc_Net_m_s2'] = acc_net_g * 9.81
 
 # ---------------------------------------------------------
-# DETECTION ALGORITHM
+# ALGORITMO DE DETECCIÓN
 # ---------------------------------------------------------
 def detect_comprehensive_events(data_df, channels, upper=None, lower=None, min_dist_s=1.0, check_slip=False, mu_stat=0.28):
     dt = data_df['elapsed_sec'].diff().median() or 0.05
@@ -261,14 +256,11 @@ events_df = detect_comprehensive_events(
 )
 
 # ---------------------------------------------------------
-# MAIN LAYOUT
+# INTERFAZ PRINCIPAL
 # ---------------------------------------------------------
-
-# 1. TÍTULO Y DESCRIPCIÓN
 st.title("📈 Measurement Processor")
 st.caption("Friction evaluation, Jerk impact analysis, displacement estimation, and root-cause diagnostics.")
 
-# 2. EL GRÁFICO E INTERFAZ PRINCIPAL PRIMERO
 tab_plot, tab_events = st.tabs([
     "📊 Interactive Chart", 
     "🚨 Event & Displacement Log"
@@ -315,7 +307,8 @@ with tab_plot:
         ))
 
     if enable_physics_model and has_3d_acc and target_group == "Acceleration (g)":
-        show_vector_xy = st.checkbox("Show Resultant Horizontal Acceleration (Acc_Horiz_XY)", value=False)
+        # Activada por defecto la señal vector XY en negro (value=True)
+        show_vector_xy = st.checkbox("Show Resultant Horizontal Acceleration (Acc_Horiz_XY)", value=True)
         show_allowed_limit = st.checkbox("Show Dynamic Friction Limit (Acc_Max_Allowed)", value=True)
         
         if show_vector_xy:
@@ -407,7 +400,9 @@ with tab_events:
             mime="text/csv"
         )
 
-# 3. MÉTRICAS Y RESUMEN AL FINAL
+# ---------------------------------------------------------
+# MÉTRICAS Y RESUMEN AL FINAL
+# ---------------------------------------------------------
 st.markdown("---")
 st.markdown("### 📊 Trace Status & Dynamics Overview")
 
